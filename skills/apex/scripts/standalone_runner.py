@@ -14,10 +14,16 @@ import logging
 import os
 import signal
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+try:
+    from cli.hl_adapter import APICircuitBreakerOpen
+except ImportError:
+    class APICircuitBreakerOpen(Exception):  # type: ignore[no-redef]
+        pass
 
 from modules.guard_config import GuardConfig, PRESETS as GUARD_PRESETS
 from modules.guard_bridge import GuardBridge
@@ -187,6 +193,10 @@ class ApexRunner:
         self._last_scheduled: Dict[str, str] = {}
 
         self._running = False
+        self._consecutive_timeouts = 0
+        self._tick_timeout_s = 30  # max seconds per tick
+        self._max_consecutive_timeouts = 3
+        self._tick_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="apex-tick")
 
     def _restore_guard_bridges(self) -> None:
         """Restore Guard bridges for active slots from persisted state."""
@@ -254,7 +264,21 @@ class ApexRunner:
                 break
 
             try:
-                self._tick()
+                future = self._tick_executor.submit(self._tick)
+                future.result(timeout=self._tick_timeout_s)
+                self._consecutive_timeouts = 0
+            except FuturesTimeoutError:
+                self._consecutive_timeouts += 1
+                log.error("APEX tick %d timed out after %ds (%d/%d consecutive)",
+                          self.state.tick_count, self._tick_timeout_s,
+                          self._consecutive_timeouts, self._max_consecutive_timeouts)
+                if self._consecutive_timeouts >= self._max_consecutive_timeouts:
+                    log.critical("APEX entering safe mode: %d consecutive tick timeouts",
+                                 self._consecutive_timeouts)
+                    self.state.safe_mode = True
+            except APICircuitBreakerOpen as e:
+                log.critical("API circuit breaker open — APEX entering safe mode: %s", e)
+                self.state.safe_mode = True
             except Exception as e:
                 log.error("Tick %d failed: %s", self.state.tick_count, e, exc_info=True)
 
@@ -313,8 +337,29 @@ class ApexRunner:
         except Exception as e:
             log.debug("Account persist failed: %s", e)
 
+    def _persist_metrics(self, tick_latency_ms: float) -> None:
+        """Write operational metrics to disk for /metrics endpoint."""
+        try:
+            metrics = {
+                "tick_count": self.state.tick_count,
+                "tick_latency_ms": round(tick_latency_ms, 1),
+                "active_slots": len(self.state.active_slots()),
+                "daily_pnl": round(self.state.daily_pnl, 2),
+                "total_pnl": round(self.state.total_pnl, 2),
+                "total_trades": self.state.total_trades,
+                "safe_mode": getattr(self.state, "safe_mode", False),
+                "consecutive_timeouts": self._consecutive_timeouts,
+                "updated_at": int(time.time() * 1000),
+            }
+            metrics_path = Path(self.data_dir) / "metrics.json"
+            with open(metrics_path, "w") as f:
+                json.dump(metrics, f)
+        except Exception:
+            pass  # metrics are best-effort
+
     def _tick(self) -> List[ApexAction]:
         """Execute a single APEX tick cycle."""
+        t0 = time.monotonic()
         self._check_config_override()
         self.state.tick_count += 1
         tick = self.state.tick_count
@@ -386,6 +431,19 @@ class ApexRunner:
 
         # 8. Persist state
         self.state_store.save(self.state)
+
+        # 9. Tick latency tracking
+        elapsed_s = time.monotonic() - t0
+        elapsed_ms = elapsed_s * 1000
+        if elapsed_s > self.tick_interval * 0.8 and self.tick_interval > 0:
+            log.warning("Tick %d took %.1fs (%.0f%% of %.0fs interval)",
+                        tick, elapsed_s, (elapsed_s / self.tick_interval) * 100,
+                        self.tick_interval)
+        else:
+            log.debug("Tick %d completed in %.1fms", tick, elapsed_ms)
+
+        # 10. Persist metrics for /metrics endpoint
+        self._persist_metrics(elapsed_ms)
 
         self._print_status()
         return actions

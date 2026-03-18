@@ -17,8 +17,17 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
 
+import logging
+import re
+
+log = logging.getLogger("entrypoint")
 START_TIME = time.time()
 CHILD_PROC: subprocess.Popen | None = None
+MAX_BODY_SIZE = 1_048_576  # 1MB max POST body
+AUTH_TOKEN = os.environ.get("API_AUTH_TOKEN")
+
+# Regex to redact hex private keys (0x + 64 hex chars)
+_SECRET_RE = re.compile(r'0x[a-fA-F0-9]{64}')
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -113,6 +122,19 @@ class HealthHandler(BaseHTTPRequestHandler):
             self._cors_headers()
             self._json_response(body)
 
+        elif self.path == "/metrics":
+            data_dir = os.environ.get("DATA_DIR", "/data")
+            metrics_path = Path(data_dir) / "apex" / "metrics.json"
+            try:
+                if metrics_path.exists():
+                    with open(metrics_path) as f:
+                        body = f.read()
+                else:
+                    body = json.dumps({"status": "no_metrics_yet"})
+            except Exception as e:
+                body = json.dumps({"error": str(e)})
+            self._json_response(body)
+
         elif self.path == "/api/scanner":
             data_dir = os.environ.get("DATA_DIR", "/data")
             try:
@@ -140,6 +162,30 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def _check_auth(self) -> bool:
+        """Check bearer token auth if API_AUTH_TOKEN is configured."""
+        if not AUTH_TOKEN:
+            return True  # no auth configured
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header == f"Bearer {AUTH_TOKEN}":
+            return True
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.write(json.dumps({"error": "unauthorized"}))
+        return False
+
+    def _read_body(self) -> bytes | None:
+        """Read POST body with size limit. Returns None if too large."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > MAX_BODY_SIZE:
+            self.send_response(413)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.write(json.dumps({"error": "request body too large", "max_bytes": MAX_BODY_SIZE}))
+            return None
+        return self.rfile.read(content_length)
+
     def do_POST(self):
         if self.path == "/api/skill/install":
             try:
@@ -156,8 +202,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                 self.write(json.dumps({"installed": False, "error": str(e)}))
 
         elif self.path == "/api/configure":
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
+            if not self._check_auth():
+                return
+            body = self._read_body()
+            if body is None:
+                return
             try:
                 config = json.loads(body)
                 data_dir = os.environ.get("DATA_DIR", "/data")
@@ -173,12 +222,16 @@ class HealthHandler(BaseHTTPRequestHandler):
                 self.write(json.dumps({"error": str(e)}))
 
         elif self.path == "/api/pause":
+            if not self._check_auth():
+                return
             if CHILD_PROC and CHILD_PROC.poll() is None:
                 os.kill(CHILD_PROC.pid, signal.SIGSTOP)
             self._cors_headers()
             self._json_response(json.dumps({"status": "paused"}))
 
         elif self.path == "/api/resume":
+            if not self._check_auth():
+                return
             if CHILD_PROC and CHILD_PROC.poll() is None:
                 os.kill(CHILD_PROC.pid, signal.SIGCONT)
             self._cors_headers()
@@ -254,7 +307,7 @@ def build_command() -> list[str]:
         return py + ["mcp", "serve", "--transport", "sse"]
 
     else:
-        print(f"Unknown RUN_MODE: {mode}. Use apex, wolf, strategy, or mcp.", file=sys.stderr)
+        log.error("Unknown RUN_MODE: %s. Use apex, wolf, strategy, or mcp.", mode)
         sys.exit(1)
 
 
@@ -262,7 +315,7 @@ def shutdown(signum, frame):
     """Forward shutdown signal to child process."""
     global CHILD_PROC
     if CHILD_PROC and CHILD_PROC.poll() is None:
-        print(f"[entrypoint] Received signal {signum}, forwarding to child (pid={CHILD_PROC.pid})")
+        log.info("Received signal %d, forwarding to child (pid=%d)", signum, CHILD_PROC.pid)
         CHILD_PROC.send_signal(signal.SIGTERM)
         try:
             CHILD_PROC.wait(timeout=15)
@@ -274,13 +327,19 @@ def shutdown(signum, frame):
 def main():
     global CHILD_PROC
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     port = int(os.environ.get("PORT", "8080"))
 
     # Start health check server in background
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     health_thread = Thread(target=server.serve_forever, daemon=True)
     health_thread.start()
-    print(f"[entrypoint] Health server listening on :{port}")
+    log.info("Health server listening on :%d", port)
 
     # Register signal handlers
     signal.signal(signal.SIGTERM, shutdown)
@@ -298,20 +357,21 @@ def main():
                 [sys.executable, "-m", "cli.main", "builder", "approve", "--yes"] + mainnet_flag,
                 capture_output=True, timeout=30,
             )
-            print("[entrypoint] Builder fee approval sent")
+            log.info("Builder fee approval sent")
         except Exception:
             pass  # best-effort
 
     # Build and run main command
     cmd = build_command()
     mode = os.environ.get("RUN_MODE", "apex")
-    print(f"[entrypoint] Starting {mode} mode: {' '.join(cmd)}")
+    safe_cmd = _SECRET_RE.sub("0x[REDACTED]", ' '.join(cmd))
+    log.info("Starting %s mode: %s", mode, safe_cmd)
 
     CHILD_PROC = subprocess.Popen(cmd)
 
     # Wait for child to finish (or be killed)
     rc = CHILD_PROC.wait()
-    print(f"[entrypoint] Process exited with code {rc}")
+    log.info("Process exited with code %d", rc)
     sys.exit(rc)
 
 
